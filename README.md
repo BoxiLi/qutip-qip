@@ -42,7 +42,7 @@ to build the documentation.
 Documentation
 -------------
 
-The documentation of `qutip-qip` updated to the latest development version is hosted at [qutip-qip.readthedocs.io/](https://qutip-qip.readthedocs.io/en/latest/).
+The documentation of `qutip-qip` updated to the latest development version is hosted at [qutip-qip.readthedocs.io/](https://qutip-qip.readthedocs.io/en/latest/). In addition, tutorials in the form of Jupyter Notebooks can also be found on the [website](http://qutip.org/tutorials#qip) or interactively on Binder. [![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/qutip/qutip-notebooks/master?filepath=index.ipynb)
 
 Support
 -------
