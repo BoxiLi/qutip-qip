@@ -146,5 +146,4 @@ jobs:
           TWINE_NON_INTERACTIVE: 1
           TWINE_REPOSITORY: pypi
         run: |
-          python -m pip install "twine"
-          python -m twine upload --verbose wheels/*.whl sdist/*.tar.gz
+          python -m pip install wheels/*.whl
