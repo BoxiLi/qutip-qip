@@ -1,8 +1,6 @@
 name: Tests
 
 on:
-  push:
-    branches: [ master ]
   pull_request:
 
 jobs:
@@ -10,7 +8,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macOS-latest]
+        os: [ubuntu-latest, macOS-latest]
 
     steps:
     - uses: actions/checkout@v2
@@ -29,7 +27,7 @@ jobs:
     - name: Upload to Coveralls
       env:
         GITHUB_TOKEN: ${{ secrets.github_token }}
-        COVERALLS_FLAG_NAME: ${{ matrix.qutip-version }}
+        COVERALLS_FLAG_NAME: ${{ matrix.python-version }}
         COVERALLS_PARALLEL: true
       run: coveralls --service=github
 
@@ -38,8 +36,8 @@ jobs:
     runs-on: ubuntu-latest
 
     strategy:
-        matrix:
-            qutip-version: ['==4.6.*', '==4.7.*', '@dev.major']
+      matrix:
+        qutip-version: ['==4.6.*', '==4.7.*']
 
     steps:
     - uses: actions/checkout@v2
@@ -103,7 +101,7 @@ jobs:
 
   finalise:
     name: Finalise coverage reporting
-    needs: [test, test-qutip-support]
+    needs: [test]
     runs-on: ubuntu-latest
     container: python:3-slim
     steps:
