@@ -1,34 +1,16 @@
+# %%
 from copy import deepcopy
 import numpy as np
+import matplotlib.pyplot as plt
 
 from qutip import qeye, tensor, destroy, basis
-from qutip_qip.device import Model, SCQubitsModel
-from qutip_qip.device.modelprocessor import ModelProcessor, _to_array
-from qutip_qip.transpiler import to_chain_structure
-# from ..compiler import SCQubitsCompiler
-from qutip_qip.noise import ZZCrossTalk
-from qutip_qip.operations import expand_operator, Gate
-from qutip_qip.compiler import GateCompiler, Instruction
-
-from itertools import product
-from functools import reduce
-from operator import mul
-
-import warnings
-import numpy as np
-import pytest
-
 import qutip
+from qutip_qip.device import Model, SCQubitsModel, ModelProcessor
+from qutip_qip.operations import expand_operator, Gate, gate_sequence_product
+from qutip_qip.compiler import GateCompiler, Instruction
 from qutip_qip.circuit import QubitCircuit
-from qutip_qip.operations import Gate, gate_sequence_product
-from qutip_qip.device import (
-    DispersiveCavityQED, LinearSpinChain, CircularSpinChain, SCQubits
-    )
 
-from packaging.version import parse as parse_version
-from qutip import Options
-
-_tol = 3.e-2
+np.set_printoptions(precision=5, linewidth=150, suppress=True)
 
 
 class SCQubits2(ModelProcessor):
@@ -42,25 +24,35 @@ class SCQubits2(ModelProcessor):
             **params,
         )
         super(SCQubits2, self).__init__(model=model)
-        self.native_gates = ["RX", "RY", "CNOT"]
+        self.native_gates = ["RX", "RY", "CSIGN"]
         self._default_compiler = SCQubitsCompiler2
         self.pulse_mode = "continuous"
 
-    def topology_map(self, qc):
-        return to_chain_structure(qc)
+    def transpile(self, qc):
+        qc = qc.resolve_gates(basis=["RX", "RY", "CSIGN"])
+        return qc
 
+
+# Inherit from SCQubitsModel to reuse some class methods.
 class SCQubitsModel2(SCQubitsModel):
     def __init__(self, num_qubits, dims=None, zz_crosstalk=False, **params):
         self.num_qubits = num_qubits
         self.dims = dims if dims is not None else [3] * num_qubits
         self.params = {
+            # Instead of a rotating frame with respect to
+            # each qubit's frequency,
+            # here we only use a rotating frame fixed by one frequency.
+            # The following wq will be added to the model by wq*a.dag()*a.
+            # But one should still use the detuning related to
+            # a reference frequency to improve the efficiency.
+            # E.g. the number below could be two qubits of 5.5 GHz and 5 GHz.
             "wq": np.array(
-                ((0.5, 0.) * int(np.ceil(self.num_qubits / 2)))[
+                ((0.5, 0.0) * int(np.ceil(self.num_qubits / 2)))[
                     : self.num_qubits
                 ]
             ),
             "alpha": [-0.3] * self.num_qubits,
-            "g": [-0.3] * (self.num_qubits - 1),
+            "g": [0.005] * (self.num_qubits - 1),
             "omega_single": [0.03] * self.num_qubits,
         }
         self.params.update(deepcopy(params))
@@ -69,8 +61,6 @@ class SCQubitsModel2(SCQubitsModel):
         self._set_up_drift()
         self._controls = self._set_up_controls()
         self._noise = []
-        if zz_crosstalk:
-            self._noise.append(ZZCrossTalk(self.params))
 
     def _set_up_drift(self):
         for m in range(self.num_qubits):
@@ -79,35 +69,30 @@ class SCQubitsModel2(SCQubitsModel):
             self._drift.append(
                 (coeff * destroy_op.dag() ** 2 * destroy_op**2, [m])
             )
+            # here important !!!!!!!!!!!!!!!!!!!!
+            # Add constant frequency (qubit detuning)
             self._drift.append(
-                (2 * np.pi * self.params["wq"][m] * destroy_op.dag() * destroy_op, [m])
+                (
+                    2
+                    * np.pi
+                    * self.params["wq"][m]
+                    * destroy_op.dag()
+                    * destroy_op,
+                    [m],
+                )
             )
-
-    def _set_up_controls(self):
-        """
-        Setup the operators.
-        We use 2π σ/2 as the single-qubit control Hamiltonian and
-        -2πZX/4 as the two-qubit Hamiltonian.
-        """
-        num_qubits = self.num_qubits
-        dims = self.dims
-        controls = {}
-
-        for m in range(num_qubits):
-            destroy_op = destroy(dims[m])
-            op = destroy_op + destroy_op.dag()
-            controls["sx" + str(m)] = (2 * np.pi / 2 * op, [m])
-
-        for m in range(num_qubits):
-            destroy_op = destroy(dims[m])
-            op = destroy_op * (-1.0j) + destroy_op.dag() * 1.0j
-            controls["sy" + str(m)] = (2 * np.pi / 2 * op, [m])
-
-        for m in range(num_qubits):
-            destroy_op = destroy(dims[m])
-            op = destroy_op.dag() * destroy_op
-            controls["sz" + str(m)] = (2 * np.pi * op, [m])
-        return controls
+            if m != self.num_qubits - 1:
+                a1 = tensor([destroy(self.dims[m]), qeye(self.dims[m + 1])])
+                a2 = tensor([qeye(self.dims[m]), destroy(self.dims[m + 1])])
+                self._drift.append(
+                    (
+                        2
+                        * np.pi
+                        * self.params["g"][m]
+                        * (a1 * a2.dag() + a1.dag() * a2),
+                        [m, m + 1],
+                    )
+                )
 
     def _compute_params(self):
         """
@@ -115,26 +100,19 @@ class SCQubitsModel2(SCQubitsModel):
         """
         pass
 
-    def get_control_latex(self):
-        """
-        Get the labels for each Hamiltonian.
-        It is used in the method method :meth:`.Processor.plot_pulses`.
-        It is a 2-d nested list, in the plot,
-        a different color will be used for each sublist.
-        """
-        num_qubits = self.num_qubits
-        labels = [
-            {f"sx{n}": r"$\sigma_x" + f"^{n}$" for n in range(num_qubits)},
-            {f"sy{n}": r"$\sigma_y" + f"^{n}$" for n in range(num_qubits)},
-            {f"sz{n}": r"$\sigma_z" + f"^{n}$" for n in range(num_qubits)},
-        ]
-        label_zx = {}
-        for m in range(num_qubits - 1):
-            label_zx[f"zx{m}{m+1}"] = r"$ZX^{" + f"{m}{m+1}" + r"}$"
-            label_zx[f"zx{m+1}{m}"] = r"$ZX^{" + f"{m+1}{m}" + r"}$"
 
-        labels.append(label_zx)
-        return labels
+def _normalized_Hann_square_pulse(t, t_r, t_tol):
+    fun = lambda t, t_r, t_tol: np.sin(np.pi / 2 / t_r * t) ** 2
+    t_hold = t_tol - 2 * t_r
+    max_value = fun(t_r, t_r, t_tol)
+    pulse = max_value
+    pulse = np.where(t < t_r, fun(t, t_r, t_tol), pulse)
+    pulse = np.where(t > t_tol - t_r, fun(t_tol - t, t_r, t_tol), pulse)
+    return pulse
+
+
+def _compute_zi_phase_accumulation(tlist, coeff):
+    return np.trapz(coeff, tlist)
 
 
 class SCQubitsCompiler2(GateCompiler):
@@ -144,39 +122,17 @@ class SCQubitsCompiler2(GateCompiler):
             {
                 "RY": self.ry_compiler,
                 "RX": self.rx_compiler,
-                # "CNOT": self.cnot_compiler,
+                "CSIGN": self.cz_compiler,
             }
         )
         self.args = {  # Default configuration
             "shape": "hann",
-            "num_samples": 1001,
+            "num_samples": 501,
             "params": self.params,
-            # "DRAG": True,
+            "DRAG": True,
         }
 
     def _rotation_compiler(self, gate, op_label, param_label, args):
-        """
-        Single qubit rotation compiler.
-
-        Parameters
-        ----------
-        gate : :obj:`~.operations.Gate`:
-            The quantum gate to be compiled.
-        op_label : str
-            Label of the corresponding control Hamiltonian.
-        param_label : str
-            Label of the hardware parameters saved in
-            :obj:`GateCompiler.params`.
-        args : dict
-            The compilation configuration defined in the attributes
-            :obj:`.GateCompiler.args` or given as a parameter in
-            :obj:`.GateCompiler.compile`.
-
-        Returns
-        -------
-        A list of :obj:`.Instruction`, including the compiled pulse
-        information for this gate.
-        """
         targets = gate.targets
         coeff, tlist = self.generate_pulse_shape(
             args["shape"],
@@ -184,22 +140,40 @@ class SCQubitsCompiler2(GateCompiler):
             maximum=self.params[param_label][targets[0]],
             area=gate.arg_value / 2.0 / np.pi,
         )
-        # if args["DRAG"]:
-        #     pulse_info = self._drag_pulse(op_label, coeff, tlist, targets[0])
         f = 2 * np.pi * self.params["wq"][targets[0]]
-        if op_label == "sx":
+        if args["DRAG"]:
+            pulse_info = self._drag_pulse(op_label, coeff, tlist, targets[0])
+        elif op_label == "sx":
             pulse_info = [
-                ("sx" + str(targets[0]), coeff * np.cos(f * tlist)),
-                ("sy" + str(targets[0]), -coeff * np.sin(f * tlist)),
-                ]
+                ("sx" + str(targets[0]), coeff),
+                # Add zero here just to make it easier to add the driving frequency later.
+                ("sy" + str(targets[0]), np.zeros(len(coeff))),
+            ]
         elif op_label == "sy":
             pulse_info = [
-                ("sx" + str(targets[0]), coeff * np.cos(f * tlist + np.pi/2)),
-                ("sy" + str(targets[0]), -coeff * np.sin(f * tlist + np.pi/2)),
-                ]
-            # pulse_info = [(op_label + str(targets[0]), coeff)]
+                ("sx" + str(targets[0]), np.zeros(len(coeff))),
+                ("sy" + str(targets[0]), coeff),
+            ]
         else:
-            pulse_info = [(op_label + str(targets[0]), coeff)]
+            raise RuntimeError("Unknown label.")
+        return [Instruction(gate, tlist, pulse_info)]
+
+    def cz_compiler(self, gate, args):
+        targets = gate.targets
+        # Bring 20 and 11 closer
+        detuning = (
+            self.params["wq"][targets[0]]
+            - self.params["wq"][targets[1]]
+            + self.params["alpha"][targets[1]]
+        )
+        t_tol = gate.arg_value["t_tol"]  # Total time
+        t_r = gate.arg_value["t_r"]  # Rising time
+        max = -gate.arg_value["strength_ratio"] * detuning  # Tuning strength
+        tlist = np.linspace(0, t_tol, 2001)
+        coeff = max * _normalized_Hann_square_pulse(tlist, t_r, t_tol)
+        pulse_info = [
+            ("sz" + str(targets[0]), coeff),
+        ]
         return [Instruction(gate, tlist, pulse_info)]
 
     def _drag_pulse(self, op_label, coeff, tlist, target):
@@ -231,29 +205,86 @@ class SCQubitsCompiler2(GateCompiler):
         return self._rotation_compiler(gate, "sx", "omega_single", args)
 
     def compile(self, circuit, schedule_mode=None, args=None):
-        compiled_tlist_map, compiled_coeffs_map = super().compile(circuit, schedule_mode=None, args=None)
+        """
+        Add the oscillating phase of the drive that matches with the qubit frequency in
+        the rotating wave approximation.
+        Here we drive at the bare qubit frequency, but this could be improved.
+        """
+        compiled_tlist_map, compiled_coeffs_map = super().compile(
+            circuit, schedule_mode=None, args=None
+        )
+        pulse_list = compiled_coeffs_map.keys()
+        for q in range(self.num_qubits):
+            if (
+                "sx" + str(q) not in pulse_list
+                and "sy" + str(q) not in pulse_list
+            ):
+                continue
+            x_coeff = compiled_coeffs_map.get("sx" + str(q), 0.0)
+            y_coeff = compiled_coeffs_map.get("sy" + str(q), 0.0)
+            # Note that if neither tlist is None, they must be identical!
+            tlist = None
+            tlist_x = compiled_tlist_map.get("sx" + str(q), None)
+            tlist_y = compiled_tlist_map.get("sy" + str(q), None)
+            tlist = tlist_x if tlist_x is not None else tlist_y
+            omega = x_coeff + 1.0j * y_coeff
+            f = 2 * np.pi * self.params["wq"][q]
+            omega *= np.exp(-1.0j * f * tlist)
+            x_coeff = np.real(omega)
+            y_coeff = np.imag(omega)
+            compiled_coeffs_map["sx" + str(q)] = x_coeff
+            compiled_coeffs_map["sy" + str(q)] = y_coeff
+            compiled_tlist_map["sx" + str(q)] = tlist
+            compiled_tlist_map["sy" + str(q)] = tlist
         return compiled_tlist_map, compiled_coeffs_map
 
 
-def _ket_expaned_dims(qubit_state, expanded_dims):
-    all_qubit_basis = list(product([0, 1], repeat=len(expanded_dims)))
-    old_dims = qubit_state.dims[0]
-    expanded_qubit_state = np.zeros(
-        reduce(mul, expanded_dims, 1), dtype=np.complex128)
-    for basis_state in all_qubit_basis:
-        old_ind = np.ravel_multi_index(basis_state, old_dims)
-        new_ind = np.ravel_multi_index(basis_state, expanded_dims)
-        expanded_qubit_state[new_ind] = qubit_state[old_ind, 0]
-    expanded_qubit_state.reshape((reduce(mul, expanded_dims, 1), 1))
-    return qutip.Qobj(
-        expanded_qubit_state, dims=[expanded_dims, [1]*len(expanded_dims)])
+def compute_dressed_frame(ham):
+    """
+    Compute the dressed state using the drift Hamiltonian.
+    The eigenstates are saved as a transformation unitary, where
+    each column corresponds to one eigenstate.
+    The transformation matrix can be obtained by
+    :obj:`.get_transformation`.
+    """
+    eigenvalues, U = np.linalg.eigh(ham.full())
+    # Permute the eigenstates in U according to the overlap
+    # with bare qubit states so that the transformed Hamiltonian
+    # match the definition of logical qubits.
+    # A logical qubit state |i> is defined as the eigenstate that
+    # has the maximal overlap with the corresponding bare qubit state |i>.
+    qubit_state_labels = np.argmax(np.abs(U), axis=0)
+    if len(qubit_state_labels) != len(set(qubit_state_labels)):
+        raise ValueError(
+            "The definition of dressed states is ambiguous."
+            "Please define the unitary manually by the attributes"
+            "Processor.dressing_unitary"
+        )
+    eigenvalues = eigenvalues[np.argsort(qubit_state_labels)]
+    U = U[:, np.argsort(qubit_state_labels)]  # Permutation
+    sign = np.real(np.sign(np.diag(U)))
+    U = U * sign
+    U = qutip.Qobj(U, dims=ham.dims)
+    return eigenvalues, U
 
 
 def get_phase_frame(t, eigenvalues, dims):
     phase_frame_U = np.diag(np.exp((1.0j * eigenvalues * t)))
     return qutip.Qobj(phase_frame_U, dims=dims)
 
-# X gate performance
+
+def get_subspace_array(qobj, indices):
+    """Return the subspace unitary e.g. for 00,01,10,11,20,02"""
+    return qobj.full()[
+        indices[:, np.newaxis],
+        indices,
+    ]
+
+
+# %%
+# Single-qubit model test
+print("Single-qubit model:")
+## Single qubit model X gate performance
 num_qubits = 1
 circuit = QubitCircuit(num_qubits)
 gates = [Gate("X", targets=[0])]
@@ -264,18 +295,23 @@ device.load_circuit(circuit)
 
 H0 = device.get_qobjevo(noisy=True)[0](0)
 eigenvalues = np.diag(H0.full())
-phase_frame_U = get_phase_frame(device.get_full_tlist()[-1], eigenvalues, H0.dims)
+phase_frame_U = get_phase_frame(
+    device.get_full_tlist()[-1], eigenvalues, H0.dims
+)
 
-qu, c_ops = device.get_qobjevo(noisy=True)
-U_list = qutip.propagator(qu.to_list(), c_op_list=c_ops, t=qu.tlist)
+quobjevo, c_ops = device.get_qobjevo(noisy=True)
+U_list = qutip.propagator(
+    quobjevo.to_list(), c_op_list=c_ops, t=quobjevo.tlist
+)
 
-numeric_gate = qutip.Qobj((phase_frame_U * U_list[-1])[:2,:2])
-print("X gate fidelity",
-    qutip.average_gate_fidelity(numeric_gate, qutip.sigmax())
-    )
+numeric_gate = qutip.Qobj((phase_frame_U * U_list[-1])[:2, :2])
+print(
+    "X gate fidelity",
+    qutip.average_gate_fidelity(numeric_gate, qutip.sigmax()),
+)
 
 
-# Y gate performance
+## Single qubit model Y gate performance
 num_qubits = 1
 circuit = QubitCircuit(num_qubits)
 gates = [Gate("Y", targets=[0])]
@@ -286,34 +322,196 @@ device.load_circuit(circuit)
 
 H0 = device.get_qobjevo(noisy=True)[0](0)
 eigenvalues = np.diag(H0.full())
-phase_frame_U = get_phase_frame(device.get_full_tlist()[-1], eigenvalues, H0.dims)
+phase_frame_U = get_phase_frame(
+    device.get_full_tlist()[-1], eigenvalues, H0.dims
+)
 
-qu, c_ops = device.get_qobjevo(noisy=True)
-U_list = qutip.propagator(qu.to_list(), c_op_list=c_ops, t=qu.tlist)
+quobjevo, c_ops = device.get_qobjevo(noisy=True)
+U_list = qutip.propagator(
+    quobjevo.to_list(), c_op_list=c_ops, t=quobjevo.tlist
+)
 
-numeric_gate = qutip.Qobj((phase_frame_U * U_list[-1])[:2,:2])
-print("Y gate fidelity",
-    qutip.average_gate_fidelity(numeric_gate, qutip.sigmay())
-    )
+numeric_gate = qutip.Qobj((phase_frame_U * U_list[-1])[:2, :2])
+print(
+    "Y gate fidelity",
+    qutip.average_gate_fidelity(numeric_gate, qutip.sigmay()),
+)
 
-
-# XY gate performance
-num_qubits = 1
+# %%############################
+print()
+# Two qubit model test
+print("Two-qubit model without coupling")
+## No coupling
+### Single qubit model single-qubit gate sequence performance
+num_qubits = 2
 circuit = QubitCircuit(num_qubits)
-gates = [Gate("X", targets=[0]), Gate("Y", targets=[0])]
+gates = [
+    Gate("X", targets=[0]),
+    Gate("Y", targets=[1]),
+    Gate("Y", targets=[0]),
+    Gate("X", targets=[0]),
+]
 for gate in gates:
     circuit.add_gate(gate)
-device = SCQubits2(num_qubits)
+# Set coupling to 0, test single-qubit gates
+device = SCQubits2(num_qubits, g=[0.0])
 device.load_circuit(circuit)
 
 H0 = device.get_qobjevo(noisy=True)[0](0)
 eigenvalues = np.diag(H0.full())
-phase_frame_U = get_phase_frame(device.get_full_tlist()[-1], eigenvalues, H0.dims)
+phase_frame_U = get_phase_frame(
+    device.get_full_tlist()[-1], eigenvalues, H0.dims
+)
 
-qu, c_ops = device.get_qobjevo(noisy=True)
-U_list = qutip.propagator(qu.to_list(), c_op_list=c_ops, t=qu.tlist)
+quobjevo, c_ops = device.get_qobjevo(noisy=True)
+U_list = qutip.propagator(
+    quobjevo.to_list(), c_op_list=c_ops, t=quobjevo.tlist
+)
 
-numeric_gate = qutip.Qobj((phase_frame_U * U_list[-1])[:2,:2])
-print("X gate fidelity",
-    qutip.average_gate_fidelity(numeric_gate, qutip.qeye(2))
+numeric_gate = qutip.Qobj(
+    get_subspace_array(phase_frame_U * U_list[-1], np.array([0, 1, 3, 4])),
+    dims=[[2, 2], [2, 2]],
+)
+
+ideal_unitary = circuit.compute_unitary()
+print(
+    "Single-qubit gate sequence fidelity",
+    qutip.average_gate_fidelity(numeric_gate, ideal_unitary),
+)
+
+## With coupling
+print("Two-qubit model with coupling")
+# Ideally we should drive with the dressed frequency, but here we still use the bare frequency.
+# Require dressed frame transformation!!!!!!!!!!!!!!!!!!!
+### Single qubit model single-qubit gate sequence performance
+num_qubits = 2
+circuit = QubitCircuit(num_qubits)
+gates = [
+    Gate("X", targets=[0]),
+    Gate("Y", targets=[1]),
+    Gate("Y", targets=[0]),
+    Gate("X", targets=[1]),
+    # Gate("Z", targets=[1]),
+]
+for gate in gates:
+    circuit.add_gate(gate)
+# Set coupling to 0, test only single-qubit gates
+device = SCQubits2(num_qubits)
+device.load_circuit(circuit)
+
+H0 = device.get_qobjevo(noisy=True)[0](0)
+eigenvalues, dressed_frame_U = compute_dressed_frame(H0)
+bare_eigenvalues = np.diag(np.real(H0))
+phase_frame_U = get_phase_frame(
+    device.get_full_tlist()[-1], eigenvalues, H0.dims
+)
+
+quobjevo, c_ops = device.get_qobjevo(noisy=True)
+U_list = qutip.propagator(
+    quobjevo.to_list(), c_op_list=c_ops, t=quobjevo.tlist
+)
+
+# Dressed frame transformation
+numeric_gate = (
+    phase_frame_U * dressed_frame_U.dag() * U_list[-1] * dressed_frame_U
+)
+numeric_gate = qutip.Qobj(
+    get_subspace_array(numeric_gate, np.array([0, 1, 3, 4])),
+    dims=[[2, 2], [2, 2]],
+)
+
+ideal_unitary = circuit.compute_unitary()
+print(
+    "Single-qubit gate sequence fidelity",
+    qutip.average_gate_fidelity(numeric_gate, ideal_unitary),
+)
+
+### Two-qubit gates
+#  CZ
+num_qubits = 2
+circuit = QubitCircuit(num_qubits)
+# CZ gate drive parameters
+params = {"t_tol": 255.0, "t_r": 10.0, "strength_ratio": 0.9}
+gates = [
+    Gate("CSIGN", targets=[0, 1], arg_value=params),
+]
+for gate in gates:
+    circuit.add_gate(gate)
+# Set coupling to 0, test single-qubit gates
+device = SCQubits2(num_qubits)
+device.load_circuit(circuit)
+
+# Dressed frame
+H0 = device.get_qobjevo(noisy=True)[0](0)
+eigenvalues, dressed_frame_U = compute_dressed_frame(H0)
+
+# Unitary evolution
+quobjevo, c_ops = device.get_qobjevo(noisy=True)
+U_list = qutip.propagator(
+    quobjevo.to_list(), c_op_list=c_ops, t=quobjevo.tlist
+)
+
+# Eigenenergies
+eigenvalues_list = []
+for t in device.get_full_tlist():
+    H = quobjevo(t)
+    eigenvalues_t, _ = H.eigenstates()
+    eigenvalues_list.append(eigenvalues_t)
+plt.plot(
+    device.get_full_tlist(),
+    np.array(eigenvalues_list) / 2 / np.pi,
+    label=["00", "01", "02", "10", "11", "12", "20", "21", "22"],
+)
+plt.xlabel("Gate time [ns]")
+plt.ylabel("Eigenenergies in the rotating frame [GHz]")
+plt.legend()
+plt.show()
+
+
+ZZ_phase_result = []
+fid_result = []
+for j, U in enumerate(U_list):
+    phase_frame_U = get_phase_frame(
+        device.get_full_tlist()[j], eigenvalues, H0.dims
     )
+    # Rotating frame correction + dressed frame correction
+    ## There is not phase_frame_U.dag()!! Unlike the dress frame transformation, the rotating frame transformation is a time-dependent one. At at t=0, it is identity.
+    numeric_gate = phase_frame_U * dressed_frame_U.dag() * U * dressed_frame_U
+    numeric_gate_qubits = qutip.Qobj(
+        get_subspace_array(numeric_gate, np.array([0, 1, 3, 4])),
+        dims=[[2, 2], [2, 2]],
+    )
+    ## ZI phase caused by the sz0 drive
+    ZI_phase_correction = (
+        -1.0j
+        * np.angle(numeric_gate_qubits[2, 2] / numeric_gate_qubits[0, 0])
+        * tensor([qutip.num(2), qeye(2)])
+    ).expm()
+    numeric_gate_qubits = ZI_phase_correction * numeric_gate_qubits
+    # Compute ZZ phase
+    ZZ_phase = np.angle(
+        numeric_gate_qubits[3, 3]
+        / numeric_gate_qubits[2, 2]
+        / numeric_gate_qubits[1, 1]
+        * numeric_gate_qubits[0, 0]
+    )
+    ZZ_phase_result.append(ZZ_phase)
+    # Compute fidelity
+    fid = qutip.average_gate_fidelity(
+        qutip.Qobj(numeric_gate_qubits, dims=[[2, 2], [2, 2]]),
+        qutip.Qobj(np.diag([1, 1, 1, -1]), dims=[[2, 2], [2, 2]]),
+    )
+    fid_result.append(fid)
+
+plt.plot(device.get_full_tlist(), ZZ_phase_result)
+plt.xlabel("Gate time [ns]")
+plt.ylabel("ZZ phase accumulated")
+plt.show()
+
+plt.plot(device.get_full_tlist(), fid_result)
+plt.xlabel("Gate time [ns]")
+plt.ylabel("CZ fidelity")
+plt.show()
+
+print("Accumulated ZZ phase", ZZ_phase_result[-1])
+print("CZ fidelity", fid_result[-1])
