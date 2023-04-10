@@ -1,8 +1,9 @@
 # %%
 from copy import deepcopy
 import numpy as np
+import math
 import matplotlib.pyplot as plt
-
+from scipy.special import erf
 from qutip import qeye, tensor, destroy, basis
 import qutip
 from qutip_qip.device import Model, SCQubitsModel, ModelProcessor
@@ -66,11 +67,13 @@ class SCQubitsModel2(SCQubitsModel):
         for m in range(self.num_qubits):
             destroy_op = destroy(self.dims[m])
             coeff = 2 * np.pi * self.params["alpha"][m] / 2.0
+            #Add anharmonicity 
             self._drift.append(
                 (coeff * destroy_op.dag() ** 2 * destroy_op**2, [m])
             )
             # here important !!!!!!!!!!!!!!!!!!!!
             # Add constant frequency (qubit detuning)
+            # Use one qubit as the reference frame
             self._drift.append(
                 (
                     2
@@ -81,6 +84,9 @@ class SCQubitsModel2(SCQubitsModel):
                     [m],
                 )
             )
+
+            """
+            #Add off-diagonal coupling terms
             if m != self.num_qubits - 1:
                 a1 = tensor([destroy(self.dims[m]), qeye(self.dims[m + 1])])
                 a2 = tensor([qeye(self.dims[m]), destroy(self.dims[m + 1])])
@@ -93,6 +99,10 @@ class SCQubitsModel2(SCQubitsModel):
                         [m, m + 1],
                     )
                 )
+            """
+            
+            
+            
 
     def _compute_params(self):
         """
@@ -100,17 +110,46 @@ class SCQubitsModel2(SCQubitsModel):
         """
         pass
 
-
+    
+    def _set_up_controls(self):
+       
+        num_qubits = self.num_qubits
+        dims = self.dims
+        controls = super()._set_up_controls()
+        for m in range(self.num_qubits):
+            if m != self.num_qubits - 1:
+                a1 = tensor([destroy(self.dims[m]), qeye(self.dims[m + 1])])
+                a2 = tensor([qeye(self.dims[m]), destroy(self.dims[m + 1])])
+                controls["Y" + str(m) + str(m + 1)] = (
+                    2 * np.pi * (a1 * a2.dag() + a1.dag() * a2),
+                    [m, m + 1]
+                    )
+        return controls         
+#A normalized Hann square pulse
+#with t_r_coup being the rising time of coupling
 def _normalized_Hann_square_pulse(t, t_r, t_tol):
-    fun = lambda t, t_r, t_tol: np.sin(np.pi / 2 / t_r * t) ** 2
+    fun = lambda t, t_r, t_tol : np.sin(np.pi / 2 / t_r * t) ** 2
+    t_r_coup = t_r / 20
     t_hold = t_tol - 2 * t_r
-    max_value = fun(t_r, t_r, t_tol)
-    pulse = max_value
-    pulse = np.where(t < t_r, fun(t, t_r, t_tol), pulse)
-    pulse = np.where(t > t_tol - t_r, fun(t_tol - t, t_r, t_tol), pulse)
+    maxvalue = fun(t_r, t_r, t_tol)
+    pulse = maxvalue
+    pulse = np.where(t < t_r, fun(t - t_r_coup, t_r, t_tol), pulse)
+    pulse = np.where(t > t_tol - t_r, fun(t_tol - t_r_coup - t, t_r, t_tol), pulse)
+    pulse = np.where(t < t_r_coup, 0, pulse)
+    pulse = np.where(t > t_tol - t_r_coup, 0, pulse)
     return pulse
 
+# A Inverse Gaussian pulse
+def _normalized_Inv_Gaussian_pulse(t, t_r, t_tol):
+    sigma = t_r/4
+    fun = lambda t, t_tol: (erf(t/sigma - 2) - erf((t - t_tol)/sigma+2))/2
+    final_value = fun(t_tol, t_tol)
+    pulse = np.where(t < t_tol, fun(t,t_tol),final_value)
+    return pulse
 
+# An Optimal Slepian pulse
+
+# Approximations of Slepian using Hann pulse
 def _compute_zi_phase_accumulation(tlist, coeff):
     return np.trapz(coeff, tlist)
 
@@ -159,20 +198,35 @@ class SCQubitsCompiler2(GateCompiler):
         return [Instruction(gate, tlist, pulse_info)]
 
     def cz_compiler(self, gate, args):
+        controls = gate.controls
         targets = gate.targets
+        wq_L = max(self.params["wq"][controls[0]], self.params["wq"][targets[0]])
+        wq_S = min(self.params["wq"][controls[0]], self.params["wq"][targets[0]])
+        if (wq_L == self.params["wq"][controls[0]]):
+            q_L = controls[0]
+        else:
+            q_L = targets[0]
         # Bring 20 and 11 closer
         detuning = (
-            self.params["wq"][targets[0]]
-            - self.params["wq"][targets[1]]
-            + self.params["alpha"][targets[1]]
+            wq_L - wq_S
+            + self.params["alpha"][targets[0]]
         )
         t_tol = gate.arg_value["t_tol"]  # Total time
         t_r = gate.arg_value["t_r"]  # Rising time
-        max = -gate.arg_value["strength_ratio"] * detuning  # Tuning strength
-        tlist = np.linspace(0, t_tol, 2001)
-        coeff = max * _normalized_Hann_square_pulse(tlist, t_r, t_tol)
+        sample_N = 2000
+        tlist = np.linspace(0, t_tol, sample_N + 1)
+        t_r_coup = t_r / 20
+        max_coup = self.params["g"][controls[0]]
+        max_amp = -gate.arg_value["strength_ratio"] * detuning  # Tuning strength
+        # With rising time of coupling strength
+        #coeff = max_amp * _normalized_Hann_square_pulse(tlist, t_r, t_tol)
+        #coeff_coup = max_coup * _normalized_Inv_Gaussian_pulse(tlist, t_r_coup, t_tol)
+        #Without rising time
+        coeff_coup = np.full(shape = [sample_N + 1,], fill_value = max_coup)
+        coeff = max_amp * _normalized_Inv_Gaussian_pulse(tlist, t_r, t_tol)
         pulse_info = [
-            ("sz" + str(targets[0]), coeff),
+            ("sz" + str(q_L), coeff),
+            ("Y" + str(controls[0]) + str(targets[0]), coeff_coup),
         ]
         return [Instruction(gate, tlist, pulse_info)]
 
@@ -318,7 +372,7 @@ gates = [Gate("Y", targets=[0])]
 for gate in gates:
     circuit.add_gate(gate)
 device = SCQubits2(num_qubits)
-device.load_circuit(circuit)
+device.load_circuit(circuit, pulse_mode = "discrete")
 
 H0 = device.get_qobjevo(noisy=True)[0](0)
 eigenvalues = np.diag(H0.full())
@@ -379,6 +433,7 @@ print(
     qutip.average_gate_fidelity(numeric_gate, ideal_unitary),
 )
 
+#%%##############
 ## With coupling
 print("Two-qubit model with coupling")
 # Ideally we should drive with the dressed frequency, but here we still use the bare frequency.
@@ -386,7 +441,7 @@ print("Two-qubit model with coupling")
 ### Single qubit model single-qubit gate sequence performance
 num_qubits = 2
 circuit = QubitCircuit(num_qubits)
-gates = [
+gates = [ 
     Gate("X", targets=[0]),
     Gate("Y", targets=[1]),
     Gate("Y", targets=[0]),
@@ -401,6 +456,7 @@ device.load_circuit(circuit)
 
 H0 = device.get_qobjevo(noisy=True)[0](0)
 eigenvalues, dressed_frame_U = compute_dressed_frame(H0)
+
 bare_eigenvalues = np.diag(np.real(H0))
 phase_frame_U = get_phase_frame(
     device.get_full_tlist()[-1], eigenvalues, H0.dims
@@ -426,25 +482,22 @@ print(
     qutip.average_gate_fidelity(numeric_gate, ideal_unitary),
 )
 
-### Two-qubit gates
-#  CZ
+
+#%%
 num_qubits = 2
 circuit = QubitCircuit(num_qubits)
+
 # CZ gate drive parameters
-params = {"t_tol": 255.0, "t_r": 10.0, "strength_ratio": 0.9}
-gates = [
-    Gate("CSIGN", targets=[0, 1], arg_value=params),
-]
+params = {"t_tol": 255.0, "t_r": 20.0, "strength_ratio": 0.9}
+gates = [Gate("CSIGN", controls = [0], targets=[1], arg_value=params)]
 for gate in gates:
     circuit.add_gate(gate)
-# Set coupling to 0, test single-qubit gates
-device = SCQubits2(num_qubits)
-device.load_circuit(circuit)
 
+device = SCQubits2(num_qubits, pulse_mode = "discrete")
+device.load_circuit(circuit)
 # Dressed frame
 H0 = device.get_qobjevo(noisy=True)[0](0)
 eigenvalues, dressed_frame_U = compute_dressed_frame(H0)
-
 # Unitary evolution
 quobjevo, c_ops = device.get_qobjevo(noisy=True)
 U_list = qutip.propagator(
@@ -467,20 +520,23 @@ plt.ylabel("Eigenenergies in the rotating frame [GHz]")
 plt.legend()
 plt.show()
 
-
 ZZ_phase_result = []
 fid_result = []
+relative_ZZ_phase_result = []
 for j, U in enumerate(U_list):
     phase_frame_U = get_phase_frame(
         device.get_full_tlist()[j], eigenvalues, H0.dims
     )
     # Rotating frame correction + dressed frame correction
-    ## There is not phase_frame_U.dag()!! Unlike the dress frame transformation, the rotating frame transformation is a time-dependent one. At at t=0, it is identity.
-    numeric_gate = phase_frame_U * dressed_frame_U.dag() * U * dressed_frame_U
+    ## There is not phase_frame_U.dag()!! Unlike the dress frame transformation, the rotating frame transformation is a time-dependent one. At at t=0, it is identity. 
+    
+    #Here, since we add g as a control pulse, we no longer need dressed frame correction
+    ## However, rotating frame correction maybe needed. 
     numeric_gate_qubits = qutip.Qobj(
-        get_subspace_array(numeric_gate, np.array([0, 1, 3, 4])),
+        get_subspace_array(phase_frame_U * U, np.array([0, 1, 3, 4])),
         dims=[[2, 2], [2, 2]],
     )
+    
     ## ZI phase caused by the sz0 drive
     ZI_phase_correction = (
         -1.0j
@@ -496,6 +552,8 @@ for j, U in enumerate(U_list):
         * numeric_gate_qubits[0, 0]
     )
     ZZ_phase_result.append(ZZ_phase)
+    relative_ZZ_phase = min(abs(ZZ_phase - np.pi), abs(ZZ_phase + np.pi))
+    relative_ZZ_phase_result.append(relative_ZZ_phase)
     # Compute fidelity
     fid = qutip.average_gate_fidelity(
         qutip.Qobj(numeric_gate_qubits, dims=[[2, 2], [2, 2]]),
@@ -506,12 +564,102 @@ for j, U in enumerate(U_list):
 plt.plot(device.get_full_tlist(), ZZ_phase_result)
 plt.xlabel("Gate time [ns]")
 plt.ylabel("ZZ phase accumulated")
+plt.savefig('acc_ZZ_phase_56.2.pdf')
 plt.show()
 
 plt.plot(device.get_full_tlist(), fid_result)
 plt.xlabel("Gate time [ns]")
 plt.ylabel("CZ fidelity")
-plt.show()
+#plt.show()
+plt.savefig('fid_56.2.pdf')
 
 print("Accumulated ZZ phase", ZZ_phase_result[-1])
 print("CZ fidelity", fid_result[-1])
+opt_gate_time_index = np.argmax(fid_result)
+optZZphase_gate_time_index = np.argmin(relative_ZZ_phase_result)
+#print("Optimal ZZ phase", relative_ZZ_phase_result[optZZphase_gate_time_index])
+print("Optimal CZ fidelity", fid_result[opt_gate_time_index])
+#print("Optimal ZZ phase corresponding fidelity", fid_result[optZZphase_gate_time_index])
+#print("Optimal gate time",device.get_full_tlist()[opt_gate_time_index])
+ #  %%
+#  Small circuit simulation 
+#  Case 1: 3-Qubit Deutsch-Jozsa Algorithm 
+qc0 = QubitCircuit(3, reverse_states = False)
+params = {"t_tol": 56.2, "t_r": 10.0, "strength_ratio": 0.9}
+Gates = {
+    Gate("X", targets = 2),
+    Gate("SNOT", targets = 0),
+    Gate("SNOT", targets = 1),
+    Gate("CSIGN", controls = 0, targets = 2,arg_value = params),
+    Gate("CSIGN", controls = 1, targets = 2,arg_value = params),
+    Gate("SNOT", targets = 0),
+    Gate("SNOT", targets = 1),
+    Gate("SNOT", targets = 2),
+}
+
+for gate in Gates:
+    qc0.add_gate(gate)
+
+def run_circuit(circuit):
+    device = SCQubits2(num_qubits)
+    device.load_circuit(circuit)
+
+    # Dressed frame
+    H0 = device.get_qobjevo(noisy=True)[0](0)
+    eigenvalues, dressed_frame_U = compute_dressed_frame(H0)
+
+    # Unitary evolution
+    quobjevo, c_ops = device.get_qobjevo(noisy=True)
+    U_list = qutip.propagator(
+        quobjevo.to_list(), c_op_list=c_ops, t=quobjevo.tlist
+    )
+
+    # Eigenenergies
+    eigenvalues_list = []
+    for t in device.get_full_tlist():
+        H = quobjevo(t)
+        eigenvalues_t, _ = H.eigenstates()
+        eigenvalues_list.append(eigenvalues_t)
+
+
+    ZZ_phase_result = []
+    fid_result = []
+    relative_ZZ_phase_result = []
+    for j, U in enumerate(U_list):
+        phase_frame_U = get_phase_frame(
+            device.get_full_tlist()[j], eigenvalues, H0.dims
+        )
+        # Rotating frame correction + dressed frame correction
+        ## There is not phase_frame_U.dag()!! Unlike the dress frame transformation, the rotating frame transformation is a time-dependent one. At at t=0, it is identity.
+        numeric_gate = phase_frame_U * dressed_frame_U.dag() * U * dressed_frame_U
+        numeric_gate_qubits = qutip.Qobj(
+            get_subspace_array(numeric_gate, np.array([0, 1, 3, 4])),
+            dims=[[2, 2], [2, 2]],
+        )
+        ## ZI phase caused by the sz0 drive
+        ZI_phase_correction = (
+            -1.0j
+            * np.angle(numeric_gate_qubits[2, 2] / numeric_gate_qubits[0, 0])
+            * tensor([qutip.num(2), qeye(2)])
+        ).expm()
+        numeric_gate_qubits = ZI_phase_correction * numeric_gate_qubits
+        # Compute ZZ phase
+        ZZ_phase = np.angle(
+            numeric_gate_qubits[3, 3]
+            / numeric_gate_qubits[2, 2]
+            / numeric_gate_qubits[1, 1]
+            * numeric_gate_qubits[0, 0]
+        )
+        ZZ_phase_result.append(ZZ_phase)
+        relative_ZZ_phase = min(abs(ZZ_phase - np.pi), abs(ZZ_phase + np.pi))
+        relative_ZZ_phase_result.append(relative_ZZ_phase)
+
+        ideal_unitary = circuit.compute_unitary()
+        # Compute fidelity
+        fid = qutip.average_gate_fidelity(
+            qutip.Qobj(numeric_gate_qubits, dims=[[2, 2], [2, 2]]),
+            ideal_unitary,
+        )
+        fid_result.append(fid)
+        return ZZ_phase_result[-1], fid_result[-1]
+# %%
