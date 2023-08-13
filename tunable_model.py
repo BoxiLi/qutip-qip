@@ -372,7 +372,7 @@ gates = [Gate("Y", targets=[0])]
 for gate in gates:
     circuit.add_gate(gate)
 device = SCQubits2(num_qubits)
-device.load_circuit(circuit, pulse_mode = "discrete")
+device.load_circuit(circuit)
 
 H0 = device.get_qobjevo(noisy=True)[0](0)
 eigenvalues = np.diag(H0.full())
@@ -488,7 +488,7 @@ num_qubits = 2
 circuit = QubitCircuit(num_qubits)
 
 # CZ gate drive parameters
-params = {"t_tol": 255.0, "t_r": 20.0, "strength_ratio": 0.9}
+params = {"t_tol": 255.0, "t_r": 20.0, "strength_ratio": 0.90}
 gates = [Gate("CSIGN", controls = [0], targets=[1], arg_value=params)]
 for gate in gates:
     circuit.add_gate(gate)
@@ -520,6 +520,7 @@ plt.ylabel("Eigenenergies in the rotating frame [GHz]")
 plt.legend()
 plt.show()
 
+#%%
 ZZ_phase_result = []
 fid_result = []
 relative_ZZ_phase_result = []
@@ -564,102 +565,16 @@ for j, U in enumerate(U_list):
 plt.plot(device.get_full_tlist(), ZZ_phase_result)
 plt.xlabel("Gate time [ns]")
 plt.ylabel("ZZ phase accumulated")
-plt.savefig('acc_ZZ_phase_56.2.pdf')
 plt.show()
 
 plt.plot(device.get_full_tlist(), fid_result)
 plt.xlabel("Gate time [ns]")
 plt.ylabel("CZ fidelity")
-#plt.show()
-plt.savefig('fid_56.2.pdf')
+plt.show()
 
 print("Accumulated ZZ phase", ZZ_phase_result[-1])
 print("CZ fidelity", fid_result[-1])
 opt_gate_time_index = np.argmax(fid_result)
 optZZphase_gate_time_index = np.argmin(relative_ZZ_phase_result)
-#print("Optimal ZZ phase", relative_ZZ_phase_result[optZZphase_gate_time_index])
 print("Optimal CZ fidelity", fid_result[opt_gate_time_index])
-#print("Optimal ZZ phase corresponding fidelity", fid_result[optZZphase_gate_time_index])
-#print("Optimal gate time",device.get_full_tlist()[opt_gate_time_index])
- #  %%
-#  Small circuit simulation 
-#  Case 1: 3-Qubit Deutsch-Jozsa Algorithm 
-qc0 = QubitCircuit(3, reverse_states = False)
-params = {"t_tol": 56.2, "t_r": 10.0, "strength_ratio": 0.9}
-Gates = {
-    Gate("X", targets = 2),
-    Gate("SNOT", targets = 0),
-    Gate("SNOT", targets = 1),
-    Gate("CSIGN", controls = 0, targets = 2,arg_value = params),
-    Gate("CSIGN", controls = 1, targets = 2,arg_value = params),
-    Gate("SNOT", targets = 0),
-    Gate("SNOT", targets = 1),
-    Gate("SNOT", targets = 2),
-}
 
-for gate in Gates:
-    qc0.add_gate(gate)
-
-def run_circuit(circuit):
-    device = SCQubits2(num_qubits)
-    device.load_circuit(circuit)
-
-    # Dressed frame
-    H0 = device.get_qobjevo(noisy=True)[0](0)
-    eigenvalues, dressed_frame_U = compute_dressed_frame(H0)
-
-    # Unitary evolution
-    quobjevo, c_ops = device.get_qobjevo(noisy=True)
-    U_list = qutip.propagator(
-        quobjevo.to_list(), c_op_list=c_ops, t=quobjevo.tlist
-    )
-
-    # Eigenenergies
-    eigenvalues_list = []
-    for t in device.get_full_tlist():
-        H = quobjevo(t)
-        eigenvalues_t, _ = H.eigenstates()
-        eigenvalues_list.append(eigenvalues_t)
-
-
-    ZZ_phase_result = []
-    fid_result = []
-    relative_ZZ_phase_result = []
-    for j, U in enumerate(U_list):
-        phase_frame_U = get_phase_frame(
-            device.get_full_tlist()[j], eigenvalues, H0.dims
-        )
-        # Rotating frame correction + dressed frame correction
-        ## There is not phase_frame_U.dag()!! Unlike the dress frame transformation, the rotating frame transformation is a time-dependent one. At at t=0, it is identity.
-        numeric_gate = phase_frame_U * dressed_frame_U.dag() * U * dressed_frame_U
-        numeric_gate_qubits = qutip.Qobj(
-            get_subspace_array(numeric_gate, np.array([0, 1, 3, 4])),
-            dims=[[2, 2], [2, 2]],
-        )
-        ## ZI phase caused by the sz0 drive
-        ZI_phase_correction = (
-            -1.0j
-            * np.angle(numeric_gate_qubits[2, 2] / numeric_gate_qubits[0, 0])
-            * tensor([qutip.num(2), qeye(2)])
-        ).expm()
-        numeric_gate_qubits = ZI_phase_correction * numeric_gate_qubits
-        # Compute ZZ phase
-        ZZ_phase = np.angle(
-            numeric_gate_qubits[3, 3]
-            / numeric_gate_qubits[2, 2]
-            / numeric_gate_qubits[1, 1]
-            * numeric_gate_qubits[0, 0]
-        )
-        ZZ_phase_result.append(ZZ_phase)
-        relative_ZZ_phase = min(abs(ZZ_phase - np.pi), abs(ZZ_phase + np.pi))
-        relative_ZZ_phase_result.append(relative_ZZ_phase)
-
-        ideal_unitary = circuit.compute_unitary()
-        # Compute fidelity
-        fid = qutip.average_gate_fidelity(
-            qutip.Qobj(numeric_gate_qubits, dims=[[2, 2], [2, 2]]),
-            ideal_unitary,
-        )
-        fid_result.append(fid)
-        return ZZ_phase_result[-1], fid_result[-1]
-# %%
