@@ -65,7 +65,7 @@ class Processor(object):
         -"step_func":
         The coefficient will be treated as a step function.
         E.g. ``tlist=[0,1,2]`` and ``coeff=[3,2]``, means that the coefficient
-        is 3 in t=[0,1) and 2 in t=[2,3). It requires
+        is 3 in t=[0,1) and 2 in t=[1,2). It requires
         ``len(coeff)=len(tlist)-1`` or ``len(coeff)=len(tlist)``, but
         in the second case the last element of ``coeff`` has no effect.
 
@@ -331,7 +331,7 @@ class Processor(object):
         return self.model.get_control_labels()
 
     def get_control_latex(self):
-        """
+        r"""
         Get the latex string for each Hamiltonian.
         It is used in the method :meth:`.Processor.plot_pulses`.
         It is a list of dictionaries.
@@ -1200,20 +1200,15 @@ class Processor(object):
         # A better solution is to use the gate, which
         # is however, much harder to implement at this stage, see also
         # https://github.com/qutip/qutip-qip/issues/184.
-        full_tlist = self.get_full_tlist()
-        if full_tlist is not None:
-            total_circuit_time = (full_tlist)[-1]
-        else:
-            total_circuit_time = 0.0
         if is_qutip5:
             options = kwargs.get("options", qutip.Options())
             if options.get("max_step", 0.0) == 0.0:
-                options["max_step"] = total_circuit_time / 25
+                options["max_step"] = self._get_max_step()
             options["progress_bar"] = False
         else:
             options = kwargs.get("options", qutip.Options())
             if options.max_step == 0.0:
-                options.max_step = total_circuit_time / 10
+                options.max_step = self._get_max_step()
             options.progress_bar = False
         kwargs["options"] = options
         # choose solver:
@@ -1227,6 +1222,17 @@ class Processor(object):
             )
 
         return evo_result
+
+    def _get_max_step(self):
+        """
+        Define the maximal sampling step for the solver.
+        """
+        full_tlist = self.get_full_tlist()
+        if full_tlist is not None:
+            total_circuit_time = (full_tlist)[-1]
+        else:
+            total_circuit_time = 0.0
+        return total_circuit_time / 10
 
     def load_circuit(self, qc):
         """

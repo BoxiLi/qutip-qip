@@ -12,7 +12,7 @@ from qutip_qip.qasm import read_qasm
 from qutip_qip.operations import (
     Gate, gates, Measurement, gate_sequence_product
 )
-
+from qutip_qip.transpiler import to_chain_structure
 from qutip_qip.decompose.decompose_single_qubit_gate import _ZYZ_rotation
 
 import qutip as qp
@@ -692,6 +692,25 @@ class TestQubitCircuit:
             "",
         ])
 
+    def test_latex_code_classical_controls(self):
+        qc = QubitCircuit(1, num_cbits=1, reverse_states=True)
+        qc.add_gate("X", targets=0, classical_controls=[0])
+        latex = qc.latex_code()
+        assert latex == self._latex_template % "\n".join([
+            r" &  &  \ctrl{1}  & \qw \\ ",
+            r" &  &  \gate{X}  & \qw \\ ",
+            "",
+        ])
+
+        qc = QubitCircuit(1, num_cbits=1, reverse_states=False)
+        qc.add_gate("X", targets=0, classical_controls=[0])
+        latex = qc.latex_code()
+        assert latex == self._latex_template % "\n".join([
+            r" &  &  \gate{X}  & \qw \\ ",
+            r" &  &  \ctrl{-1}  & \qw \\ ",
+            "",
+        ])
+
     H = Qobj([[1/np.sqrt(2), 1/np.sqrt(2)], [1/np.sqrt(2), -1/np.sqrt(2)]])
     H_zyz_gates = _ZYZ_rotation(H)
     H_zyz_quantum_circuit = QubitCircuit(1)
@@ -763,3 +782,14 @@ class TestQubitCircuit:
         with pytest.warns(DeprecationWarning):
             from qutip_qip.circuit import Gate, Measurement
             Gate("X", 0)
+
+    def test_circuit_chain_structure(self):
+        """
+        Test if the transpiler correctly inherit the properties of a circuit.
+        """
+        qc = QubitCircuit(3, reverse_states=True)
+        qc.add_gate("CNOT", 2, 0)
+        qc2 = to_chain_structure(qc)
+
+        assert qc2.reverse_states is True
+        assert qc2.input_states == [None] * 3

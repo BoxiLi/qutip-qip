@@ -206,9 +206,21 @@ class DispersiveCavityQED(ModelProcessor):
             range(1, len(final_processor_state.dims[0]))
         )
 
+    def _get_max_step(self):
+        """
+        Define the maximal sampling step for the solver.
+        """
+        full_tlist = self.get_full_tlist()
+        if full_tlist is not None:
+            # For this model, discrete pulses are used.
+            # Hence we use half of the gate time as the step size.
+            return np.min(np.diff(full_tlist)) / 2
+        else:
+            return 0.0
+
 
 class CavityQEDModel(Model):
-    """
+    r"""
     The physical model for a dispersive cavity-QED processor
     (:obj:`.DispersiveCavityQED`).
     It is a qubit-resonator model that describes a system composed of
